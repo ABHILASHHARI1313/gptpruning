@@ -15,29 +15,18 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-torch.autograd.set_detect_anomaly(True)
-
 
 class Pruner:
-    """Wanda pruning"""
-
     def __init__(self, config):
         self.sparsity = config.sparsity
 
-    def wandaPrune(self, weight, input):
+    def magnitudePrune(self, weight):
         with torch.no_grad():
             a, b = weight.shape
-            # print("The weight before pruning is : ", weight)
-            p, q, r = input.shape
-            input = input.view(p * q, r)
-            metric = weight.abs() * input.norm(p=2, dim=0)
-            _, sorted_idx = torch.sort(metric, dim=1)
+            weight = weight.abs()
+            _, sorted_idx = torch.sort(weight, dim=1)
             pruned_idx = sorted_idx[:, : int(b * self.sparsity)]
-            # print("The pruned_idx is", pruned_idx)
-            # src = torch.zeros(a, b)
             weight.scatter_(dim=1, index=pruned_idx, value=0)
-            # print("The weight is : ", weight)
-            # exit()
         return weight
 
 
@@ -68,7 +57,6 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.pruning = config.pruning
         self.p1 = Pruner(config)
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
@@ -91,17 +79,9 @@ class CausalSelfAttention(nn.Module):
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        # Disable gradient tracking for this operation
-        # print("The gradient is", self.c_attn.weight)
-        if self.pruning == True:
-            with torch.no_grad():
-                pruned_weights = self.p1.wandaPrune(self.c_attn.weight.clone(), x)
-                self.c_attn.weight.data = pruned_weights
-        else:
-            pass
-        # print("The causal attention", self.c_attn.weight)
-        # exit()
-        # print("The gradient is", self.c_attn.weight)
+        with torch.no_grad():
+            pruned_weights = self.p1.magnitudePrune(self.c_attn.weight.clone())
+            self.c_attn.weight.data = pruned_weights
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(
             1, 2
         )  # (B, nh, T, hs)
@@ -135,14 +115,11 @@ class CausalSelfAttention(nn.Module):
         )  # re-assemble all head outputs side by side
 
         # output projection
-        z = self.c_proj(y)
-        if self.pruning == True:
-            with torch.no_grad():
-                pruned_weights = self.p1.wandaPrune(self.c_proj.weight.clone(), y)
-                self.c_proj.weight.data = pruned_weights
-        else:
-            pass
-        y = self.resid_dropout(z)
+        y = self.c_proj(y)
+        y = self.resid_dropout(y)
+        with torch.no_grad():
+            pruned_weights = self.p1.magnitudePrune(self.c_proj.weight.clone())
+            self.c_proj.weight.data = pruned_weights
         return y
 
 
@@ -155,25 +132,18 @@ class MLP(nn.Module):
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
         self.p2 = Pruner(config)
-        self.pruning = config.pruning
 
     def forward(self, x):
-        y = self.c_fc(x)
-        if self.pruning == True:
-            with torch.no_grad():
-                pruned_weights = self.p2.wandaPrune(self.c_fc.weight.clone(), x)
-                self.c_fc.weight.data = pruned_weights
-        else:
-            pass
-        x = self.gelu(y)
-        z = self.c_proj(x)
-        if self.pruning == True:
-            with torch.no_grad():
-                pruned_weights = self.p2.wandaPrune(self.c_proj.weight.clone(), x)
-                self.c_proj.weight.data = pruned_weights
-        else:
-            pass
-        x = self.dropout(z)
+        x = self.c_fc(x)
+        with torch.no_grad():
+            pruned_weights = self.p2.magnitudePrune(self.c_fc.weight.clone())
+            self.c_fc.weight.data = pruned_weights
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        with torch.no_grad():
+            pruned_weights = self.p2.magnitudePrune(self.c_proj.weight.clone())
+            self.c_proj.weight.data = pruned_weights
+        x = self.dropout(x)
         return x
 
 
@@ -201,9 +171,8 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
-    sparsity: float = 0.5
     dropout: float = 0.0
-    pruning: bool = True
+    sparsity: float = 0.5
     bias: bool = (
         True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     )
@@ -216,6 +185,7 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
+
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.vocab_size, config.n_embd),
@@ -233,10 +203,7 @@ class GPT(nn.Module):
         self.transformer.wte.weight = (
             self.lm_head.weight
         )  # https://paperswithcode.com/method/weight-tying
-        """Weight Tying : Sharing the weight matrix between input-to-embedding layer and output-to-softmax layer; 
-        That is, instead of using two weight matrices, we just use only one weight matrix. 
-        The intuition behind doing so is to combat the problem of overfitting. 
-        Thus, weight tying can be considered as a form of regularization."""
+
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
@@ -276,6 +243,7 @@ class GPT(nn.Module):
             t <= self.config.block_size
         ), f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
+
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (t, n_embd)
@@ -370,10 +338,7 @@ class GPT(nn.Module):
             sd_keys
         ), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
         for k in sd_keys_hf:
-            if any(
-                k.endswith(w) for w in transposed
-            ):  # Some layers in Hugging Face's GPT-2 use Conv1D, while the custom model uses Linear. For these layers, weights are transposed during copying.
-                # All other weights are copied directly, ensuring shape alignment.
+            if any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights we need to transpose
                 assert sd_hf[k].shape[::-1] == sd[k].shape
                 with torch.no_grad():
